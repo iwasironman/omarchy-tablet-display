@@ -1,0 +1,640 @@
+#!/bin/bash
+#
+# omarchy-tablet-display-ctl -- the backend for the Tablet Display plugin.
+#
+# Turns an Android tablet or iPad running Moonlight into a second screen for
+# Hyprland, streamed by Sunshine instead of Miracast/AirPlay so latency stays
+# in game-streaming territory (~10-30 ms on a good LAN).
+#
+# How it works:
+#   extend  -- creates a headless Hyprland output (TABLET-1 by default), sizes
+#              it with a runtime hl.monitor() rule, points Sunshine's
+#              output_name at it, and restarts Sunshine. Moonlight on the tablet
+#              then streams that output.
+#   mirror  -- points Sunshine at an existing monitor (the focused one, unless
+#              named) and restarts Sunshine. No output is created.
+#   off     -- restores sunshine.conf exactly as it was, restarts (or stops)
+#              Sunshine, and removes the headless output.
+#
+# Sunshine reads output_name once when it starts, which is why every mode
+# change restarts it. Our settings live in a marked block at the end of
+# sunshine.conf; any of the user's own lines for the same keys are commented
+# out with a recognisable prefix while we are active and put back afterwards.
+#
+# A global_prep_cmd hook (hook-start / hook-stop) tells us when Moonlight opens
+# a session and at what resolution, so with resolution "auto" the headless
+# output is resized to exactly what the tablet asked for.
+#
+# The panel polls `state` every couple of seconds; it also reconciles: it
+# notices the output disappearing (Hyprland restart), re-applies the monitor
+# rule after a `hyprctl reload` wipes it, cleans up after a reboot, and maps
+# Sunshine's virtual touch/pen devices onto the streamed output.
+
+set -uo pipefail
+
+APP=omarchy-tablet-display
+CTL=$(realpath "${BASH_SOURCE[0]}")
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
+RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$APP"
+SETTINGS="$STATE_DIR/settings.json"
+# What sunshine.conf calls. It lives outside the plugin so that removing the
+# plugin without turning it off first cannot leave Sunshine calling a missing
+# file, which would abort every stream.
+HOOK="$STATE_DIR/sunshine-hook"
+SESSION="$RUN_DIR/session.json"
+LOCK="$RUN_DIR/lock"
+LOG="$RUN_DIR/ctl.log"
+
+SUNSHINE_CONF="${OMARCHY_TABLET_DISPLAY_SUNSHINE_CONF:-$HOME/.config/sunshine/sunshine.conf}"
+OUTPUT_NAME="${OMARCHY_TABLET_DISPLAY_OUTPUT:-TABLET-1}"
+DEFAULT_RESOLUTION="${OMARCHY_TABLET_DISPLAY_DEFAULT_RESOLUTION:-2560x1600}" # Galaxy Tab S9
+
+MARK_BEGIN="# >>> $APP: managed block, removed when the tablet display is turned off"
+MARK_END="# <<< $APP"
+DISABLED_PREFIX="#$APP# "
+MANAGED_KEYS="output_name|capture|global_prep_cmd|stream_audio"
+
+DEFAULT_SETTINGS='{"position":"right","scale":"2","resolution":"auto","refresh":"auto","audio":false,"lastClient":null}'
+EMPTY_SESSION='{"mode":"off","output":"","target":"","sunshineWasRunning":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
+
+mkdir -p "$STATE_DIR" "$RUN_DIR"
+
+log() { printf '%s %s\n' "$(date +%T)" "$*" >>"$LOG"; }
+
+# ---------------------------------------------------------------- environment
+
+# Sunshine runs our hooks from its own environment, which under some setups
+# lacks Hyprland's instance signature. Fall back to the newest instance.
+ensure_hypr_env() {
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && return 0
+  local dir
+  dir=$(ls -td "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/hypr/*/ 2>/dev/null | head -1)
+  [[ -n $dir ]] && export HYPRLAND_INSTANCE_SIGNATURE=$(basename "$dir")
+}
+ensure_hypr_env
+
+# ---------------------------------------------------------------- json files
+
+read_json() { # file default
+  local v
+  v=$(jq -c . "$1" 2>/dev/null) && [[ -n $v ]] && { printf '%s' "$v"; return; }
+  printf '%s' "$2"
+}
+settings() { jq -c --argjson d "$DEFAULT_SETTINGS" '$d + .' <<<"$(read_json "$SETTINGS" '{}')"; }
+session() { jq -c --argjson d "$EMPTY_SESSION" '$d + .' <<<"$(read_json "$SESSION" '{}')"; }
+
+write_atomic() { # file content
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  printf '%s\n' "$2" >"$tmp" && mv -f "$tmp" "$1"
+}
+update_settings() { write_atomic "$SETTINGS" "$(settings | jq -c "$@")"; }
+update_session() { write_atomic "$SESSION" "$(session | jq -c "$@")"; }
+
+add_error() { log "error: $1"; update_session '.errors = (.errors + [$m])[-5:]' --arg m "$1"; }
+set_notice() { update_session '.notice = $m' --arg m "$1"; }
+
+# All mutations go through this lock. `state` only tries briefly, and reports
+# without reconciling when an operation (which can take a few seconds while
+# Sunshine restarts) is holding it.
+with_lock() {
+  exec 9>"$LOCK"
+  flock -w "${LOCK_WAIT:-30}" 9 || { echo "$APP: busy" >&2; return 75; }
+  "$@"
+}
+
+# ---------------------------------------------------------------- sunshine
+
+sunshine_installed() { command -v sunshine >/dev/null 2>&1; }
+sunshine_running() { pgrep -x sunshine >/dev/null 2>&1; }
+# The package ships app-dev.lizardbyte.app.Sunshine.service, with
+# "sunshine.service" only as an Alias= that exists once the unit is enabled.
+SUNSHINE_PKG_UNIT=app-dev.lizardbyte.app.Sunshine.service
+SUNSHINE_UNIT=""
+sunshine_has_unit() {
+  [[ -n $SUNSHINE_UNIT ]] && return 0
+  local u
+  for u in "$SUNSHINE_PKG_UNIT" sunshine.service; do
+    if systemctl --user cat "$u" >/dev/null 2>&1; then SUNSHINE_UNIT=$u; return 0; fi
+  done
+  return 1
+}
+
+stop_sunshine() {
+  if sunshine_has_unit; then systemctl --user stop "$SUNSHINE_UNIT" 2>/dev/null; fi
+  pkill -x sunshine 2>/dev/null
+  for _ in {1..30}; do sunshine_running || return 0; sleep 0.1; done
+  pkill -9 -x sunshine 2>/dev/null
+}
+
+# Kills every instance first: Omarchy's installer both enables the systemd unit
+# and adds a Hyprland autostart, and a stray copy would hold the ports.
+restart_sunshine() {
+  stop_sunshine
+  if sunshine_has_unit; then
+    systemctl --user reset-failed "$SUNSHINE_UNIT" 2>/dev/null
+    systemctl --user start "$SUNSHINE_UNIT" || return 1
+  else
+    # 9>&- : the daemon must not inherit, and so hold forever, our lock.
+    setsid -f sunshine >>"$RUN_DIR/sunshine.log" 2>&1 </dev/null 9>&- || return 1
+  fi
+  # The packaged unit sleeps 5 s before starting (ExecStartPre), so give it time.
+  for _ in {1..150}; do sunshine_running && return 0; sleep 0.1; done
+  return 1
+}
+
+conf_has_block() { [[ -f $SUNSHINE_CONF ]] && grep -qF "$MARK_BEGIN" "$SUNSHINE_CONF"; }
+
+# Puts sunshine.conf back exactly as the user had it.
+restore_conf() {
+  [[ -f $SUNSHINE_CONF ]] || return 0
+  local out
+  out=$(awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v p="$DISABLED_PREFIX" '
+    $0 == b { skip = 1; next }
+    skip && $0 == e { skip = 0; next }
+    skip { next }
+    index($0, p) == 1 { print substr($0, length(p) + 1); next }
+    { print }
+  ' "$SUNSHINE_CONF") || return 1
+  # Drop the blank line apply_conf added before the block.
+  out=$(printf '%s\n' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  write_atomic "$SUNSHINE_CONF" "$out"
+}
+
+# Sunshine runs prep commands directly, without a shell, and aborts the stream
+# when one fails. While the plugin exists this just hands over to it. If the
+# plugin has been removed, it puts sunshine.conf back the way it was and exits
+# 0, so streaming keeps working.
+write_hook() {
+  mkdir -p "$STATE_DIR"
+  write_atomic "$HOOK" "$(cat <<HOOK_EOF
+#!/bin/sh
+# Written by $APP. Sunshine runs this when a Moonlight session starts or ends.
+ctl='$CTL'
+if [ -x "\$ctl" ]; then exec "\$ctl" "\$@"; fi
+# The plugin is gone: undo its sunshine.conf changes (they take effect the
+# next time Sunshine starts) and do nothing else.
+conf='$SUNSHINE_CONF'
+[ -f "\$conf" ] && sed -i -e '/^# >>> $APP:/,/^# <<< $APP\$/d' -e 's/^#$APP# //' "\$conf"
+exit 0
+HOOK_EOF
+)" && chmod 755 "$HOOK"
+}
+
+# apply_conf <output_name>
+apply_conf() {
+  local target="$1" audio existing ours merged
+  restore_conf || return 1
+  mkdir -p "$(dirname "$SUNSHINE_CONF")"
+  touch "$SUNSHINE_CONF"
+
+  [[ $HOOK =~ [[:space:]] ]] && { add_error "Path contains spaces; Sunshine cannot run its hook: $HOOK"; return 1; }
+  write_hook || return 1
+
+  # Keep any global_prep_cmd the user already has, and add ours after it.
+  ours=$(jq -cn --arg c "$HOOK" '[{do: ($c + " hook-start"), undo: ($c + " hook-stop"), elevated: false}]')
+  existing=$(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF" | tail -1)
+  merged=$(jq -c --argjson o "$ours" '(if type == "array" then . else [] end) + $o' <<<"${existing:-[]}" 2>/dev/null) || merged="$ours"
+
+  audio=$(settings | jq -r 'if .audio then "enabled" else "disabled" end')
+
+  local body
+  body=$(awk -v p="$DISABLED_PREFIX" -v keys="^[[:space:]]*($MANAGED_KEYS)[[:space:]]*=" '
+    $0 ~ keys { print p $0; next } { print }
+  ' "$SUNSHINE_CONF") || return 1
+
+  write_atomic "$SUNSHINE_CONF" "$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n%s' \
+    "$body" "$MARK_BEGIN" \
+    "output_name = $target" \
+    "capture = wlr" \
+    "stream_audio = $audio" \
+    "global_prep_cmd = $merged" \
+    "$MARK_END")"
+}
+
+# ---------------------------------------------------------------- hyprland
+
+monitors_json() { hyprctl -j monitors all 2>/dev/null || echo '[]'; }
+monitor_exists() { monitors_json | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null; }
+
+hypr_eval() {
+  local out
+  out=$(hyprctl eval "$1" 2>&1)
+  [[ $out == ok* ]] && return 0
+  log "hyprctl eval failed: $1 -> $out"
+  return 1
+}
+
+position_keyword() {
+  case "$1" in
+    left) echo auto-left ;; above) echo auto-up ;; below) echo auto-down ;; *) echo auto-right ;;
+  esac
+}
+
+# The width, height and refresh the headless output should have right now.
+#
+# Auto refresh runs the output at twice the stream rate. Sunshine's Wayland
+# capture asks for a frame and then waits for the output's next one; with both
+# at 60 Hz and out of phase, that wait plus Sunshine's own pacing sleep lands
+# at ~30-35 fps. At 2x a fresh frame is never more than half a stream frame
+# away. (Newer Sunshine switches to event-driven capture at >= 1.5x for the
+# same reason.)
+desired_mode() {
+  settings | jq -r --arg def "$DEFAULT_RESOLUTION" '
+    (if .resolution == "auto" then
+       (if .lastClient then "\(.lastClient.width)x\(.lastClient.height)" else $def end)
+     else .resolution end) as $res
+    | (if .refresh == "auto" then ((.lastClient.fps // 60) * 2 | if . > 240 then 240 else . end)
+       else (.refresh | tonumber) end) as $hz
+    | "\($res)@\($hz)"'
+}
+
+# What the output actually looks like, to notice someone else changing it
+# (a `hyprctl reload` drops our runtime rule and Hyprland falls back to the
+# catch-all rule, typically 1920x1080 at the global scale).
+monitor_signature() {
+  monitors_json | jq -r --arg n "$1" '
+    .[] | select(.name == $n) | "\(.width)x\(.height)@\(.refreshRate | round)*\(.scale * 100 | round)/\(.x),\(.y)"'
+}
+
+apply_monitor_rule() {
+  local out="$1" mode pos scale
+  mode=$(desired_mode)
+  pos=$(position_keyword "$(settings | jq -r .position)")
+  scale=$(settings | jq -r .scale)
+  [[ $mode =~ ^[0-9]{3,5}x[0-9]{3,5}@[0-9]{2,3}$ ]] || { add_error "Bad mode: $mode"; return 1; }
+  [[ $scale =~ ^[0-9]+(\.[0-9]+)?$ ]] || scale=2
+  hypr_eval "hl.monitor({ output = \"$out\", mode = \"$mode\", position = \"$pos\", scale = $scale })" || return 1
+  sleep 0.2
+  update_session '.applied = $s' --arg s "$(monitor_signature "$out")"
+}
+
+create_output() {
+  local out="$1"
+  monitor_exists "$out" && return 0
+  hyprctl output create headless "$out" >/dev/null 2>&1
+  for _ in {1..20}; do monitor_exists "$out" && return 0; sleep 0.1; done
+  return 1
+}
+
+remove_output() {
+  local out="$1"
+  monitor_exists "$out" || return 0
+  hyprctl output remove "$out" >/dev/null 2>&1
+}
+
+focused_monitor() {
+  monitors_json | jq -r --arg skip "$OUTPUT_NAME" '
+    (map(select(.name != $skip and .disabled != true))) as $m
+    | (($m | map(select(.focused)) | .[0]) // $m[0] // {}).name // empty'
+}
+
+# Sunshine's virtual touchscreen and pen ("Touch passthrough", "Pen
+# passthrough") only exist once a client uses them, and Hyprland spreads
+# absolute devices across the whole layout unless told which output they
+# belong to. Pin them to the streamed output.
+map_input_devices() {
+  local target="$1" names name
+  [[ -n $target ]] || return 0
+  names=$(hyprctl -j devices 2>/dev/null | jq -r '
+    [(.touch // [])[], (.tablets // [])[]] | map(.name // empty)
+    | map(select(test("passthrough|sunshine"; "i"))) | unique[]') || return 0
+  while IFS= read -r name; do
+    [[ -n $name && $name =~ ^[A-Za-z0-9._:()-]+$ ]] || continue
+    session | jq -e --arg k "$name=$target" '.mapped | index($k)' >/dev/null && continue
+    if hypr_eval "hl.device({ name = \"$name\", output = \"$target\" })"; then
+      log "mapped $name -> $target"
+      update_session '.mapped = ((.mapped | map(select(startswith($n + "=") | not))) + [$k])' \
+        --arg n "$name" --arg k "$name=$target"
+    fi
+  done <<<"$names"
+}
+
+unmap_input_devices() {
+  local entry name
+  while IFS= read -r entry; do
+    name="${entry%%=*}"
+    [[ -n $name ]] && hypr_eval "hl.device({ name = \"$name\", output = \"\" })"
+  done < <(session | jq -r '.mapped[]?')
+  update_session '.mapped = []'
+}
+
+# ---------------------------------------------------------------- operations
+
+teardown() { # [notice]
+  local s mode out was
+  s=$(session)
+  mode=$(jq -r .mode <<<"$s")
+  out=$(jq -r .output <<<"$s")
+  was=$(jq -r .sunshineWasRunning <<<"$s")
+
+  update_session '.busy = "stopping"'
+  unmap_input_devices
+  restore_conf || add_error "Could not restore $SUNSHINE_CONF"
+  if [[ $mode != off ]]; then
+    if [[ $was == true ]]; then
+      restart_sunshine || add_error "Sunshine did not come back after restoring its config"
+    else
+      stop_sunshine
+    fi
+  fi
+  [[ $mode == extend && -n $out ]] && remove_output "$out"
+  update_session '. + {mode: "off", output: "", target: "", client: null, applied: "", busy: "", notice: $n}' \
+    --arg n "${1:-}"
+  log "off"
+}
+
+do_start() { # mode [target]
+  local mode="$1" target="${2:-}" was
+  sunshine_installed || { add_error "Sunshine is not installed. Run omarchy-install-service-sunshine."; return 1; }
+
+  if [[ $(session | jq -r .mode) != off ]]; then
+    # Keep the original "was Sunshine running" answer across a mode switch.
+    was=$(session | jq -r .sunshineWasRunning)
+    teardown
+  else
+    sunshine_running && was=true || was=false
+  fi
+
+  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off"}'
+
+  if [[ $mode == extend ]]; then
+    target="$OUTPUT_NAME"
+    if ! create_output "$target"; then
+      add_error "Hyprland would not create the headless output $target"
+      update_session '.busy = ""'
+      return 1
+    fi
+    apply_monitor_rule "$target" || add_error "Could not apply the monitor rule to $target"
+  else
+    [[ -n $target ]] || target=$(focused_monitor)
+    if [[ -z $target ]] || ! monitor_exists "$target"; then
+      add_error "No monitor to mirror"
+      update_session '.busy = ""'
+      return 1
+    fi
+  fi
+
+  # Record the session before touching Sunshine, so a failure from here on is
+  # cleaned up by `off` or by the next reconcile.
+  update_session '. + {mode: $m, output: (if $m == "extend" then $t else "" end), target: $t, sunshineWasRunning: $w}' \
+    --arg m "$mode" --arg t "$target" --argjson w "$was"
+
+  if ! apply_conf "$target"; then
+    add_error "Could not write $SUNSHINE_CONF"
+    teardown
+    return 1
+  fi
+  if ! restart_sunshine; then
+    add_error "Sunshine failed to start; see: journalctl --user -u app-dev.lizardbyte.app.Sunshine"
+    update_session '.busy = ""'
+    return 1
+  fi
+
+  update_session '.busy = ""'
+  log "$mode -> $target"
+}
+
+# Called by Sunshine (global_prep_cmd) when Moonlight starts a session. Must be
+# fast and must exit 0: a failing prep command aborts the stream.
+hook_start() {
+  local w="${SUNSHINE_CLIENT_WIDTH:-}" h="${SUNSHINE_CLIENT_HEIGHT:-}" fps="${SUNSHINE_CLIENT_FPS:-}"
+  log "hook-start ${w}x${h}@${fps}"
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || return 0
+  [[ $fps =~ ^[0-9]+$ ]] || fps=60
+  # Moonlight on some devices asks for portrait sizes; a landscape output
+  # with the same pixel count is what Sunshine will scale into anyway.
+  update_settings '.lastClient = {width: $w, height: $h, fps: $f}' \
+    --argjson w "$w" --argjson h "$h" --argjson f "$fps"
+  update_session '.client = {width: $w, height: $h, fps: $f, since: now | floor}' \
+    --argjson w "$w" --argjson h "$h" --argjson f "$fps"
+
+  local s
+  s=$(session)
+  if [[ $(jq -r .mode <<<"$s") == extend ]]; then
+    apply_monitor_rule "$(jq -r .output <<<"$s")"
+  fi
+}
+
+hook_stop() {
+  log "hook-stop"
+  update_session '.client = null'
+}
+
+# Fixes drift between what we think is going on and what is. Cheap enough to
+# run on every poll.
+reconcile() {
+  local s mode out target
+  s=$(session)
+  mode=$(jq -r .mode <<<"$s")
+  out=$(jq -r .output <<<"$s")
+  target=$(jq -r .target <<<"$s")
+
+  if [[ $mode == off ]]; then
+    # Left over from a crash or a reboot: the runtime dir is gone but the
+    # config still points Sunshine at a display that does not exist.
+    if conf_has_block; then
+      log "reconcile: stale sunshine.conf block, restoring"
+      restore_conf
+      sunshine_running && restart_sunshine
+    fi
+    return 0
+  fi
+
+  [[ -n $(jq -r .busy <<<"$s") ]] && return 0
+
+  if ! monitor_exists "$target"; then
+    log "reconcile: $target vanished"
+    teardown "$target went away, so the tablet display was turned off."
+    return 0
+  fi
+
+  if [[ $mode == extend ]]; then
+    local now applied
+    now=$(monitor_signature "$out")
+    applied=$(jq -r .applied <<<"$s")
+    if [[ -n $applied && $now != "$applied" ]]; then
+      log "reconcile: $out drifted ($now != $applied), re-applying"
+      apply_monitor_rule "$out"
+    fi
+  fi
+
+  map_input_devices "$target"
+}
+
+print_state() {
+  local s st mons addrs
+  s=$(session)
+  st=$(settings)
+  mons=$(monitors_json)
+  addrs=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print $2 "=" a[1]}' |
+    jq -Rsc 'split("\n") | map(select(. != "") | split("=") | {iface: .[0], ip: .[1]})')
+
+  jq -cn \
+    --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson addrs "${addrs:-[]}" \
+    --argjson installed "$(sunshine_installed && echo true || echo false)" \
+    --argjson running "$(sunshine_running && echo true || echo false)" \
+    --arg host "$(cat /etc/hostname 2>/dev/null || hostname)" \
+    --arg defres "$DEFAULT_RESOLUTION" --arg ours "$OUTPUT_NAME" \
+    '{
+      installed: $installed,
+      running: $running,
+      mode: $s.mode,
+      busy: $s.busy,
+      output: $s.output,
+      target: $s.target,
+      client: $s.client,
+      errors: $s.errors,
+      notice: $s.notice,
+      settings: $st,
+      defaultResolution: $defres,
+      monitor: ($mons | map(select(.name == $s.target)) | .[0]
+                | if . then {name, width, height, refresh: (.refreshRate | round), scale, x, y} else null end),
+      monitors: ($mons | map(select(.name != $ours and .disabled != true) | .name)),
+      host: $host,
+      addresses: $addrs
+    }
+    # Moonlight defaults to 1280x720. A stream whose shape differs from the
+    # display gets bars on two sides, and the tablet then adds bars on the
+    # other two when its own screen is a different shape again.
+    | .hint = (
+        if .client and .monitor then
+          (.client.width / .client.height) as $cr
+          | (.monitor.width / .monitor.height) as $mr
+          | "\(.client.width)×\(.client.height)" as $c
+          | "\(.monitor.width)×\(.monitor.height)" as $m
+          | if (($cr - $mr) | fabs) / $mr > 0.02 then
+              "Moonlight is streaming at \($c), which is a different shape from this \($m) display, so you will see black bars. In Moonlight settings on the tablet, set Resolution to Native (\($m)) and reconnect."
+            elif .client.width < 1600 then
+              "Moonlight is streaming at only \($c), so it will look soft. In Moonlight settings on the tablet, set Resolution to Native and reconnect."
+            else "" end
+        else "" end)'
+}
+
+cmd_state() {
+  if [[ ${1:-} != --no-reconcile ]]; then
+    exec 9>"$LOCK"
+    if flock -w 0.3 9; then reconcile; fi
+    exec 9>&-
+  fi
+  print_state
+}
+
+cmd_set() { # key value
+  local key="$1" value="$2"
+  case "$key" in
+    position) [[ $value =~ ^(left|right|above|below)$ ]] || return 64 ;;
+    scale) [[ $value =~ ^[0-9](\.[0-9]{1,3})?$ ]] || return 64 ;;
+    resolution) [[ $value == auto || $value =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || return 64 ;;
+    refresh) [[ $value =~ ^(auto|[0-9]{2,3})$ ]] || return 64 ;;
+    audio) [[ $value =~ ^(true|false)$ ]] || return 64 ;;
+    *) echo "unknown setting: $key" >&2; return 64 ;;
+  esac
+  if [[ $key == audio ]]; then
+    update_settings '.audio = ($v == "true")' --arg v "$value"
+  else
+    update_settings '.[$k] = $v' --arg k "$key" --arg v "$value"
+  fi
+
+  local s mode
+  s=$(session)
+  mode=$(jq -r .mode <<<"$s")
+  case "$key" in
+    audio)
+      # Only Sunshine reads this, and only at start.
+      if [[ $mode != off ]]; then
+        apply_conf "$(jq -r .target <<<"$s")" && restart_sunshine
+      fi
+      ;;
+    *)
+      [[ $mode == extend ]] && apply_monitor_rule "$(jq -r .output <<<"$s")"
+      ;;
+  esac
+  return 0
+}
+
+open_admin() { # [path]
+  local url="https://localhost:47990${1:-}"
+  if command -v omarchy-launch-webapp >/dev/null; then
+    setsid -f omarchy-launch-webapp "$url" --ignore-certificate-errors >/dev/null 2>&1
+  else
+    setsid -f xdg-open "$url" >/dev/null 2>&1
+  fi
+}
+
+cmd_doctor() {
+  echo "== $APP doctor"
+  echo "sunshine:        $(command -v sunshine || echo 'NOT INSTALLED (run omarchy-install-service-sunshine)')"
+  echo "sunshine running: $(sunshine_running && echo yes || echo no)"
+  echo "systemd unit:     $(sunshine_has_unit && echo "$SUNSHINE_UNIT ($(systemctl --user is-active "$SUNSHINE_UNIT"))" || echo none)"
+  echo "sunshine hook:    $HOOK -> $CTL"
+  echo "sunshine.conf:    $SUNSHINE_CONF ($(conf_has_block && echo managed || echo untouched))"
+  echo "hyprland:         $(hyprctl version -j 2>/dev/null | jq -r .tag)"
+  echo "encoder hint:     $(lspci 2>/dev/null | grep -iE 'vga|3d' | sed 's/.*: //' | head -2 | paste -sd';')"
+  if command -v ufw >/dev/null && sudo -n true 2>/dev/null; then
+    echo "ufw rules:        $(sudo -n ufw status | grep -c omarchy-sunshine) omarchy-sunshine rules"
+  fi
+  echo
+  echo "== session";  session | jq .
+  echo "== settings"; settings | jq .
+  echo "== monitors"; monitors_json | jq -r '.[] | "\(.name)\t\(.width)x\(.height)@\(.refreshRate)\tscale \(.scale)\tat \(.x),\(.y)"'
+  echo "== sunshine-ish input devices"
+  hyprctl -j devices | jq -r '[.mice[], .keyboards[], .touch[], .tablets[]] | map(.name // empty) | map(select(test("passthrough|sunshine"; "i")))[]' 2>/dev/null
+  echo "== last log lines"; tail -n 20 "$LOG" 2>/dev/null
+}
+
+usage() {
+  cat >&2 <<USAGE
+usage: $APP-ctl <command>
+
+  state [--no-reconcile]   print state as JSON (the panel polls this)
+  extend                   stream a new headless output to Moonlight
+  mirror [monitor]         stream an existing monitor (default: focused)
+  off                      stop, restore sunshine.conf, remove the output
+  set <key> <value>        position left|right|above|below
+                           scale    1|1.25|1.5|1.6|2|...
+                           resolution auto|<W>x<H>
+                           refresh  auto|60|90|120
+                           audio    true|false (play sound on the tablet)
+  pair                     open Sunshine's PIN page to pair Moonlight
+  admin                    open Sunshine's web UI
+  install                  install Sunshine (Omarchy installer, needs sudo)
+  clear-errors             dismiss errors and notices
+  uninstall                turn off, restore sunshine.conf, delete state
+                           (run before: omarchy plugin remove $APP)
+  doctor                   print diagnostics
+
+Sunshine calls 'hook-start' and 'hook-stop' itself when Moonlight connects.
+USAGE
+  exit 64
+}
+
+case "${1:-}" in
+  state) cmd_state "${2:-}" ;;
+  extend) with_lock do_start extend ;;
+  mirror) with_lock do_start mirror "${2:-}" ;;
+  off) with_lock teardown ;;
+  set) [[ $# -eq 3 ]] || usage; with_lock cmd_set "$2" "$3" ;;
+  hook-start) LOCK_WAIT=5 with_lock hook_start; exit 0 ;;
+  hook-stop) LOCK_WAIT=5 with_lock hook_stop; exit 0 ;;
+  pair) open_admin /pin ;;
+  admin) open_admin ;;
+  # Omarchy's own installer fails on the current package (it enables the
+  # sunshine.service alias, which systemctl refuses); ours is a fixed copy.
+  install)
+    setsid -f omarchy-launch-floating-terminal-with-presentation \
+      "$(dirname "$CTL")/omarchy-tablet-display-install-sunshine" >/dev/null 2>&1
+    ;;
+  clear-errors) with_lock update_session '.errors = [] | .notice = ""' ;;
+  # Run before `omarchy plugin remove`: turns everything off, restores
+  # sunshine.conf, and deletes the plugin's state. Sunshine itself stays.
+  uninstall)
+    with_lock teardown
+    restore_conf
+    rm -rf "$STATE_DIR" "$RUN_DIR"
+    echo "$APP: turned off, sunshine.conf restored, state removed. Now run: omarchy plugin remove $APP"
+    ;;
+  doctor) cmd_doctor ;;
+  *) usage ;;
+esac

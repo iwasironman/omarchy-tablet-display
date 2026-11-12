@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-tablet-display",
+  "name": "Tablet Display",
+  "version": "0.2.0",
+  "author": "Steven Southwell",
+  "license": "MIT",
+  "description": "Use an Android tablet or iPad as a low-latency second screen, mirrored or extended, streamed with Sunshine to Moonlight",
+  "keywords": ["tablet", "second screen", "sunshine", "moonlight", "extend", "mirror", "ipad", "android"],
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tablet Display",
+    "description": "Extend or mirror the desktop onto a tablet running Moonlight",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

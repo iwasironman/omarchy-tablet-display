@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# Installs Sunshine the way omarchy-install-service-sunshine does (same ports,
+# same ufw comment, same admin web app, so omarchy-remove-service-sunshine
+# still undoes it), with two differences:
+#
+#   * It enables the unit by its real name. The package ships
+#     app-dev.lizardbyte.app.Sunshine.service with sunshine.service only as an
+#     Alias=, and `systemctl enable` refuses to operate on an alias, so
+#     Omarchy's `systemctl --user enable --now sunshine` fails.
+#   * It does not also add a Hyprland autostart entry. The enabled unit
+#     already starts Sunshine with the graphical session; a second copy would
+#     fight it for the ports.
+
+set -e
+
+UNIT=app-dev.lizardbyte.app.Sunshine.service
+TCP_PORTS=(47984 47989 48010)
+UDP_PORTS=(5353 47998 47999 48000 48002 48010)
+PRIVATE_CIDRS=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+UFW_COMMENT="omarchy-sunshine"
+SUNSHINE_ADMIN_APP="Sunshine Admin"
+SUNSHINE_ADMIN_URL="https://localhost:47990"
+SUNSHINE_ICON_SOURCE="/usr/share/sunshine/web/images/logo-sunshine-45.png"
+HYPR_AUTOSTART_FILE="$HOME/.config/hypr/autostart.lua"
+HYPR_AUTOSTART_ENTRY='o.launch_on_start("sunshine")'
+
+open_ufw_ports() {
+  local port cidr proto
+
+  if ! command -v ufw >/dev/null; then
+    echo "UFW is not installed; skipping firewall rules."
+    return
+  fi
+
+  for proto in tcp udp; do
+    local -n ports="${proto^^}_PORTS"
+    for port in "${ports[@]}"; do
+      for cidr in "${PRIVATE_CIDRS[@]}"; do
+        sudo ufw allow in proto "$proto" from "$cidr" to any port "$port" comment "$UFW_COMMENT" >/dev/null
+      done
+      if ip link show tailscale0 >/dev/null 2>&1; then
+        sudo ufw allow in on tailscale0 to any port "$port" proto "$proto" comment "$UFW_COMMENT" >/dev/null
+      fi
+    done
+  done
+
+  sudo ufw reload
+}
+
+echo "Installing Sunshine..."
+omarchy-pkg-add sunshine
+systemctl --user daemon-reload
+systemctl --user enable --now "$UNIT"
+
+echo "Opening Sunshine firewall ports for private LANs and Tailscale..."
+open_ufw_ports
+
+echo "Installing Sunshine admin web app..."
+omarchy-webapp-install "$SUNSHINE_ADMIN_APP" "$SUNSHINE_ADMIN_URL" "$SUNSHINE_ICON_SOURCE" \
+  "omarchy-launch-webapp $SUNSHINE_ADMIN_URL --ignore-certificate-errors"
+
+# An earlier run of Omarchy's own installer may have added this before it
+# failed; the unit makes it redundant.
+if [[ -f $HYPR_AUTOSTART_FILE ]]; then
+  sed -i "\|^$HYPR_AUTOSTART_ENTRY$|d" "$HYPR_AUTOSTART_FILE"
+fi
+
+echo
+echo "Sunshine is installed and running. Opening the admin page:"
+echo "create a username and password there, then pick Extend or Mirror in the Tablet Display panel."
+setsid -f omarchy-launch-webapp "$SUNSHINE_ADMIN_URL" --ignore-certificate-errors >/dev/null 2>&1

@@ -130,15 +130,38 @@ the CPU, which is far too slow for a desktop at tablet resolution.
 
 ### Which driver you need
 
-| GPU | Encoder Sunshine uses | Package | Notes |
-|---|---|---|---|
-| Intel, 5th gen (Broadwell) and newer, including Iris Xe and Arc | VA-API (`h264_vaapi`, `hevc_vaapi`, AV1 on Arc and Core Ultra) | `intel-media-driver` | Omarchy installs this on Intel machines. **Tested.** |
-| Intel, older than Broadwell | VA-API, H.264 only | `libva-intel-driver` | Expect 1080p at most. |
-| AMD (GCN and newer) | VA-API | `mesa`, which includes the VA-API driver on Arch | Should work. Not tested yet. |
-| NVIDIA | NVENC | `nvidia-utils` | Should work. Omarchy's Sunshine package is built without CUDA, so frames go GPU → RAM → GPU, which costs some performance. Not tested yet. |
+You normally don't have to install anything: Omarchy's installer already adds the
+right driver for your GPU.
 
-On laptops with two GPUs, Sunshine encodes on the GPU that drives the display it
-captures. That's normally the integrated one.
+| GPU | Encoder Sunshine uses | Package | Installed by Omarchy? | Status |
+|---|---|---|---|---|
+| Intel HD, UHD, Iris and Iris Xe (5th gen / Broadwell and newer) | VA-API, `iHD` driver (`h264_vaapi`, `hevc_vaapi`) | `intel-media-driver` | Yes, with `libvpl` and `vpl-gpu-rt` | **Tested** on Iris Xe (Tiger Lake). |
+| Intel Arc, and Core Ultra graphics | Same VA-API path; also **AV1** (`av1_vaapi`) | `intel-media-driver` | Yes, same script | Should work. Not tested yet. |
+| Intel older than Broadwell | VA-API, H.264 only | `libva-intel-driver` | Yes | Expect 1080p at most. |
+| AMD (GCN and newer) | VA-API, `radeonsi` driver; AV1 on RX 7000 and newer | `mesa` (it includes the VA-API driver) | Yes, `mesa` is always installed | Should work. Not tested yet. Check with `vainfo` (below). |
+| NVIDIA | NVENC; AV1 on RTX 40 and newer | `nvidia-utils` (or `nvidia-580xx-utils` for older cards) | Yes, with the NVIDIA driver | Should work. Not tested yet. Omarchy's Sunshine package is built without CUDA, so each frame takes an extra copy through system memory: a little more CPU and latency. |
+
+`libva-nvidia-driver`, which Omarchy also installs on NVIDIA machines, is only for
+video *decoding*; Sunshine doesn't use it.
+
+### Laptops with two GPUs (Intel or AMD plus NVIDIA)
+
+Hyprland normally draws the desktop on the integrated GPU, but Sunshine tries
+its encoders in the order NVENC, Vulkan, VA-API, software. It can therefore end
+up encoding on the NVIDIA card. Every frame is then
+copied from one GPU to the other through system memory. That wakes the NVIDIA
+GPU, costs battery, and adds latency for nothing.
+
+Tell Sunshine to stay on the integrated GPU. With the tablet display **Off**, open
+Sunshine Admin → **Configuration** → **Advanced** → **Force a Specific Encoder**,
+choose **VA-API** and save. That writes this to `sunshine.conf`:
+
+```ini
+encoder = vaapi
+```
+
+The plugin never touches the `encoder` setting, so it stays in place. Confirm the
+choice with the log check in [Check what Sunshine picked](#check-what-sunshine-picked).
 
 ### Check that hardware encoding is available
 

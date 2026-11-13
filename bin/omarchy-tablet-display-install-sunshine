@@ -48,6 +48,16 @@ open_ufw_ports() {
   sudo ufw reload
 }
 
+# --firewall: only (re)open the ports. Used by the panel when the tablet is
+# connected by USB and ufw would block it.
+if [[ ${1:-} == --firewall ]]; then
+  echo "Opening Sunshine's ports for private networks (LAN, USB tethering) and Tailscale..."
+  open_ufw_ports
+  echo
+  echo "Done. Moonlight can now reach Sunshine over the USB cable."
+  exit 0
+fi
+
 echo "Installing Sunshine..."
 omarchy-pkg-add sunshine
 systemctl --user daemon-reload

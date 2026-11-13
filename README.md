@@ -16,10 +16,13 @@ which does the same job over Miracast and AirPlay.
 - **Extend** adds the tablet as a new monitor. Hyprland treats it like any other
   display: move windows and workspaces onto it, and the Omarchy bar appears on it.
 - **Mirror** shows the monitor you're using on the tablet.
+- **Over Wi-Fi or a USB cable.** With USB tethering, latency and frame pacing
+  are noticeably better than Wi-Fi; see [Over USB](#over-usb).
 - The tablet display always matches the resolution Moonlight asks for, so the
   picture fills the screen with no black bars from mismatched sizes.
-- Touch works in both of Moonlight's modes: direct touch (tap where you want to
-  click) and trackpad mode (drag to move the pointer).
+- Touch works in Moonlight's trackpad mode, and the S Pen and touchscreen are
+  pinned to the tablet's screen. Direct touch is currently misaligned; see
+  [Known issues](#known-issues).
 
 Tested on Omarchy with Hyprland 0.56, a Galaxy Tab S9 Ultra, and Intel Iris Xe
 (Tiger Lake) graphics. iPad, AMD and NVIDIA should work but haven't been tested.
@@ -35,12 +38,14 @@ Reports are welcome.
 4. [Hardware encoding](#hardware-encoding)
 5. [Set up Moonlight on the tablet](#set-up-moonlight-on-the-tablet)
 6. [Use it](#use-it)
-7. [Performance](#performance)
-8. [What this plugin changes on your system](#what-this-plugin-changes-on-your-system)
-9. [Troubleshooting](#troubleshooting)
-10. [Remove](#remove)
-11. [How it works](#how-it-works)
-12. [Command line](#command-line)
+7. [Over USB](#over-usb)
+8. [Performance](#performance)
+9. [What this plugin changes on your system](#what-this-plugin-changes-on-your-system)
+10. [Troubleshooting](#troubleshooting)
+11. [Known issues](#known-issues)
+12. [Remove](#remove)
+13. [How it works](#how-it-works)
+14. [Command line](#command-line)
 
 ---
 
@@ -52,7 +57,7 @@ Reports are welcome.
 | [Sunshine](https://github.com/LizardByte/Sunshine) | The streaming host. The panel can install it for you; see [Install](#install). |
 | A GPU with hardware video encoding | Intel (5th gen / Broadwell and newer), AMD, or NVIDIA. See [Hardware encoding](#hardware-encoding). |
 | [Moonlight](https://moonlight-stream.org) on the tablet | Free from the [Play Store](https://play.google.com/store/apps/details?id=com.limelight) or the [App Store](https://apps.apple.com/app/moonlight-game-streaming/id1000551566). |
-| The PC and tablet on the same network | 5 GHz or 6 GHz Wi-Fi, or wired for the PC. Tailscale works too, with more latency. |
+| A connection between the PC and tablet | A **USB cable with USB tethering** (best), the same 5 or 6 GHz Wi-Fi network, or Tailscale (more latency). |
 | `jq`, `inotify-tools` | Already part of Omarchy. |
 
 ## Install
@@ -211,12 +216,12 @@ These log lines are normal and harmless:
 
 | Setting | Recommended | Why |
 |---|---|---|
-| Resolution | **1080p** on integrated graphics; **Native** on a dedicated GPU | See [Performance](#performance). |
+| Resolution | **Native** over USB; **1080p** over Wi-Fi | See [Performance](#performance). |
 | Frame rate | **60 FPS** | 120 FPS works if your GPU keeps up at your resolution. |
 | Video bitrate | 20–40 Mbps at 1080p; 40–80 Mbps at native | Higher looks better but needs better Wi-Fi. |
 | Video codec | **HEVC** (H.265) | Better quality than H.264 at the same bitrate. Only use AV1 if your GPU can encode AV1. |
 | Frame pacing | **Balanced** or **Prefer smoothest video** | "Lowest latency" can stutter on Wi-Fi. |
-| Touch screen as trackpad | Your choice | Off: touches land where you tap. On: the screen acts like a laptop trackpad, which is handier for small targets. Both work. |
+| Touch screen as trackpad | **On** | The screen acts like a laptop trackpad. Direct touch (off) is currently misaligned; see [Known issues](#known-issues). |
 | Stretch video to full screen | Off | It distorts the picture when the shape doesn't match; see [Performance](#performance). |
 | Show performance stats | On while you're tuning | Shows frame rate, network latency and decode time. |
 | Play audio on PC | Your choice | The panel's **Play sound on the tablet** toggle controls whether Sunshine sends audio at all. |
@@ -237,21 +242,63 @@ The panel also has:
   tablet; **1** gives the most space.
 - **Play sound on the tablet**.
 - **Enter pairing PIN** and the gear icon, which open Sunshine's admin page.
-- A **Live** badge while a Moonlight session is open.
+- A **Live** badge while Moonlight is connected, **Live · USB** when it's over
+  the cable. If you close Moonlight without **Quit app**, the panel says it's
+  disconnected; reconnecting picks up where you left off.
 
 Middle-clicking the bar icon switches between **Extend** and **Off**.
 
+## Over USB
+
+A USB cable gives lower latency and steadier frame pacing than Wi-Fi. Sunshine
+and Moonlight work exactly the same; only the address Moonlight connects to
+changes.
+
+1. Connect the tablet to the PC with a USB cable.
+2. Turn on **USB tethering** on the tablet. On Samsung: **Settings →
+   Connections → Mobile Hotspot and Tethering → USB tethering**. On other
+   Android tablets it's under **Network & internet → Hotspot & tethering**.
+   The tablet's Wi-Fi can be off. On an iPad this is **Personal Hotspot** over
+   USB, which needs a cellular model; this hasn't been tested.
+3. The panel shows **Tablet connected by USB. In Moonlight, add `<address>`**.
+   In Moonlight, tap **+** and add that address. Moonlight recognises it as the
+   same, already-paired PC.
+4. Choose **Extend** or **Mirror** and open **Desktop** in Moonlight. The panel
+   shows **Live · USB** while the stream goes over the cable.
+
+**Firewall.** The Sunshine installer allows Sunshine's ports from all private
+address ranges, which is where tethering addresses come from, so the cable
+works whichever USB port you use and whatever address the tablet picks. The
+panel checks this by reading `ufw`'s rules. If they would block the tablet (for
+example, Sunshine was installed some other way), the panel says so and offers
+**Allow in firewall**. That opens the same ports the installer would and asks
+for your password.
+
+**Your internet stays on Wi-Fi.** A tethered tablet also offers the PC an
+internet connection, and NetworkManager prefers wired connections. While the
+tablet display is on, the plugin takes the default route off the USB link, so
+the PC's internet keeps going through Wi-Fi or Ethernet. It uses
+`nmcli device modify <iface> ipv4.never-default yes ipv6.never-default yes`: this
+applies to the current connection only, nothing is saved, and it resets when you
+unplug the cable. It never applies when the cable is the PC's only connection.
+To turn this off: `$CTL set usb-keep-internet false` (see [Command line](#command-line)).
+
+Detected adapters: `rndis_host` (Samsung and most Android tablets), `cdc_ncm` and
+`cdc_ether` (other Android tablets), and `ipheth` (iPad). Tested with a Galaxy
+Tab S9 Ultra over USB 2 (`rndis_host`).
+
 ## Performance
 
-**Start at 1080p on integrated graphics.** On an Intel Iris Xe, a 2960×1848
-stream holds 60 fps while the picture is still, but drops to about 35 fps
-whenever something moves (video, scrolling, dragging windows) and to about
-24 fps while the mouse moves fast. At 1080p it holds 60 fps.
+**Over USB, native resolution works even on integrated graphics.** On an Intel
+Iris Xe laptop, a Galaxy Tab S9 Ultra runs at its native 2960×1848 at 120 fps
+over a USB 2 cable, with steady frame times.
 
-The encoder isn't the limit: the same GPU encodes 2960×1848 at over 100 fps. The
-cost is Hyprland drawing the extra display, which has blur, animations and a
-software cursor, on the same GPU that drives your laptop screen. A dedicated GPU
-has much more headroom.
+**Over Wi-Fi, start at 1080p.** On the same laptop over 5 GHz Wi-Fi, a
+2960×1848 stream held 60 fps while the picture was still, but dropped to about
+35 fps whenever something moved (video, scrolling, dragging windows). A moving
+picture needs far more data per frame, and the Wi-Fi link couldn't keep up. At
+1080p it held 60 fps. The GPU wasn't the limit: it encodes 2960×1848 at over
+100 fps.
 
 **Black bars at 1080p.** Most tablets are 16:10 and 1080p is 16:9, so you get
 thin bars at the top and bottom. The plugin can't fix this: Moonlight's frame
@@ -264,9 +311,9 @@ rate, for example 120 Hz for a 60 fps stream. Sunshine's Wayland capture asks
 for a frame and then waits for the display's next refresh. At the same rate as
 the stream, that wait halves the frame rate. You don't need to set anything.
 
-**Network.** If Moonlight's stats show dropped frames or high jitter, move the PC
-to 5 or 6 GHz Wi-Fi or a cable, lower the bitrate, or try USB tethering from the
-tablet.
+**Network.** If Moonlight's stats show dropped frames or high jitter, use
+[USB](#over-usb), move the PC to 5 or 6 GHz Wi-Fi or a cable, or lower the
+bitrate.
 
 ## What this plugin changes on your system
 
@@ -284,6 +331,7 @@ Nothing else is installed.
 | Your own lines for those four keys, commented out with `#omarchy-tablet-display# ` | same file | Yes, restored as they were |
 | A small hook script Sunshine calls when Moonlight connects | `~/.local/state/omarchy-tablet-display/sunshine-hook` | Kept (it's harmless) |
 | Sunshine is restarted | | Restarted again, or stopped if it wasn't running before |
+| Over USB: the USB link stops carrying the PC's default route (`nmcli device modify`, runtime only) | NetworkManager, for the current connection | Resets when the cable is unplugged; nothing is saved |
 
 Your own `global_prep_cmd` entries keep running: the plugin adds its hook after
 them. Plugin settings are in
@@ -305,15 +353,38 @@ Start with the built-in diagnostics:
 | Problem | Fix |
 |---|---|
 | Installing Sunshine fails with `Unit sunshine.service does not exist` | You used Omarchy's installer. Use **Install Sunshine** in the panel instead; see [Install](#install). |
+| Moonlight can't connect over USB | Check that USB tethering is on and the panel shows the USB address, and add *that* address in Moonlight. If the panel says the firewall blocks it, click **Allow in firewall**. `doctor` shows the link, its driver and speed, and the firewall verdict. |
+| The PC's internet goes through the tablet | The plugin only moves it back while the tablet display is on, and only if Wi-Fi or Ethernet is also connected. Check `doctor`'s `usb link` line. |
+| The panel says Moonlight is disconnected, but it's on screen | Moonlight was closed without **Quit app** and then resumed; the panel follows Sunshine's log and updates within a few seconds. |
 | Moonlight can't find the PC | Add it by IP address (shown in the panel). Check the firewall rules with `sudo ufw status \| grep omarchy-sunshine`, and that both devices are on the same network. Some routers isolate Wi-Fi clients from each other. |
 | Pairing fails | Create the admin login first ([Set up Sunshine](#set-up-sunshine)), then enter the PIN with **Enter pairing PIN**. |
 | Black bars on all four sides | Moonlight is still on 720p, its default. Set Resolution to 1080p or Native. The panel shows a warning when the shapes don't match. |
-| Low frame rate when things move | Lower Moonlight's resolution; see [Performance](#performance). Check that Sunshine uses the hardware encoder ([Check what Sunshine picked](#check-what-sunshine-picked)). |
+| Low frame rate when things move | Use [USB](#over-usb), or lower Moonlight's resolution; see [Performance](#performance). Check that Sunshine uses the hardware encoder ([Check what Sunshine picked](#check-what-sunshine-picked)). |
 | Black screen, or the wrong screen | `journalctl --user -u app-dev.lizardbyte.app.Sunshine -e`. Make sure the display is on **Extend** or **Mirror** *before* connecting. Moonlight's **Quit app**, then reconnect. |
 | Moonlight shows Desktop, Low Res Desktop and Steam | Those are Sunshine's default apps; delete the extra ones in Sunshine Admin → Applications. |
-| Touches land in the wrong place | With trackpad mode off, taps should land under your finger. If not, check `doctor` for mapped `passthrough` devices and report it. |
+| Taps land in the wrong place | That's direct touch; see [Known issues](#known-issues). Turn on **Touch screen as trackpad** in Moonlight. |
 | The tablet display vanished after `hyprctl reload` | The plugin re-applies its monitor rule within a few seconds. If Hyprland itself restarted, the plugin turns itself off; choose Extend again. |
 | `Failed to gain CAP_SYS_ADMIN` in the log | Harmless; see [Hardware encoding](#hardware-encoding). |
+
+## Known issues
+
+**Direct touch is misaligned.** With Moonlight's **Touch screen as trackpad**
+turned off, a tap moves the pointer to the wrong place: horizontally it always
+lands at the left edge of the tablet, and when the tablet display is scaled,
+vertical positions are off too. Use trackpad mode, which works normally.
+
+What's known so far:
+
+- Moonlight for Android sends direct-touch taps as absolute mouse positions
+  (its native touch path is disabled in the app's source). Sunshine replays them
+  through its `libvirtualhid-mouse-(absolute)` virtual device.
+- With the Sunshine build Omarchy ships (2026.914, the first with
+  `libvirtualhid` input), that device never emits a horizontal position, which
+  you can confirm by reading its events. Its vertical position is correct when
+  the tablet display is at scale 1.
+- The same tablet and Moonlight work with direct touch on a niri desktop, so the
+  cause is on the PC side: the Sunshine build, or how Sunshine reads a Hyprland
+  headless output's layout. It's being investigated.
 
 ## Remove
 
@@ -368,6 +439,8 @@ $CTL extend | mirror [monitor] | off
 $CTL set position left|right|above|below
 $CTL set scale 1|1.25|1.6|2
 $CTL set audio true|false
+$CTL set usb-keep-internet true|false   # see Over USB; default true
+$CTL firewall              # open Sunshine's ports in ufw (asks for your password)
 $CTL state | jq .
 $CTL pair | admin          # open Sunshine's PIN page / admin page
 $CTL doctor

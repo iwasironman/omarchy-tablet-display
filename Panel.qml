@@ -38,7 +38,12 @@ Panel {
   readonly property bool working: commandProc.running || state.busy !== ""
   readonly property string mode: state.mode
   readonly property bool live: mode !== "off"
-  readonly property bool streaming: live && state.client !== null
+  // Connected right now, from Sunshine's own log: a session left open in
+  // Moonlight without quitting still has a client, but nobody is watching.
+  readonly property bool streaming: live && state.connected === true
+  readonly property bool overUsb: streaming && !!state.link && state.link.via === "usb"
+  readonly property var usbLinks: state.usb || []
+  readonly property bool usbBlocked: usbLinks.some(function(l) { return l.firewall === "blocked" || l.firewall === "unknown" })
   readonly property var s: state.settings
 
   function parse(text) {
@@ -84,8 +89,13 @@ Panel {
   readonly property string detailLine: {
     if (!state.installed || !live) return ""
     if (!state.running) return "Sunshine is not running"
-    if (streaming) return "Moonlight session open at " + resLabel(state.client.width + "x" + state.client.height)
-      + " @ " + state.client.fps + " fps"
+    if (streaming) {
+      var via = !state.link ? "" : ({ usb: " over USB", wifi: " over Wi-Fi", tailscale: " over Tailscale", network: " over the network" }[state.link.via] || "")
+      return "Moonlight connected" + via
+        + (state.client ? " · " + resLabel(state.client.width + "x" + state.client.height) + " @ " + state.client.fps + " fps" : "")
+    }
+    if (state.client) return "Moonlight disconnected. Reconnect from Moonlight to pick up where you left off."
+    if (usbLinks.length > 0) return "Waiting for Moonlight: over USB, connect to " + usbLinks[0].ip
     return "Waiting for Moonlight: connect to " + (state.host || "this PC")
   }
 
@@ -101,7 +111,7 @@ Panel {
     text: root.glyph
     active: root.streaming
     dimmed: !root.live
-    tooltipText: "Tablet Display · " + root.statusLine
+    tooltipText: "Tablet Display · " + root.statusLine + (root.overUsb ? " · over USB" : "")
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.setMode(root.live ? "off" : "extend")
       else root.toggle()
@@ -135,7 +145,7 @@ Panel {
           title: "Tablet Display"
           meta: root.statusLine
           // A short pill only; PanelHero neither elides nor wraps it.
-          detail: root.streaming ? "Live" : ""
+          detail: root.overUsb ? "Live · USB" : (root.streaming ? "Live" : "")
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
           iconComponent: Component {
@@ -357,6 +367,56 @@ Panel {
           width: parent.width
           spacing: Style.spacing.sm
           visible: root.state.installed
+
+          // USB tethering: the tablet reaches Sunshine over the cable at this
+          // computer's address on the USB link.
+          Row {
+            width: parent.width
+            visible: root.usbLinks.length > 0
+            spacing: Style.spacing.sm
+
+            Text {
+              id: usbGlyph
+              textFormat: Text.PlainText
+              text: "󰕓"
+              color: Color.accent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+            }
+            Text {
+              width: parent.width - usbGlyph.width - parent.spacing
+              textFormat: Text.PlainText
+              text: root.overUsb
+                ? "Streaming over USB"
+                : "Tablet connected by USB. In Moonlight, add " + root.usbLinks.map(function(l) { return l.ip }).join(" or ")
+              color: Color.accent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+          }
+          Text {
+            width: parent.width
+            visible: root.usbBlocked
+            textFormat: Text.PlainText
+            text: root.usbLinks.some(function(l) { return l.firewall === "blocked" })
+              ? "The firewall blocks Sunshine on the USB link, so Moonlight can't connect over the cable."
+              : "Couldn't read the firewall rules. If Moonlight can't connect over USB, allow Sunshine through the firewall."
+            color: Color.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+          Button {
+            visible: root.usbBlocked
+            text: "Allow in firewall"
+            iconText: "󰒃"
+            bordered: true
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            onClicked: root.run(["firewall"])
+          }
 
           Text {
             width: parent.width

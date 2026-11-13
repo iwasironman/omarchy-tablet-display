@@ -55,8 +55,8 @@ MARK_END="# <<< $APP"
 DISABLED_PREFIX="#$APP# "
 MANAGED_KEYS="output_name|capture|global_prep_cmd|stream_audio"
 
-DEFAULT_SETTINGS='{"position":"right","scale":"2","resolution":"auto","refresh":"auto","audio":false,"lastClient":null}'
-EMPTY_SESSION='{"mode":"off","output":"","target":"","sunshineWasRunning":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
+DEFAULT_SETTINGS='{"position":"right","scale":"2","resolution":"auto","refresh":"auto","audio":false,"usbKeepInternet":true,"lastClient":null}'
+EMPTY_SESSION='{"mode":"off","output":"","target":"","sunshineWasRunning":false,"client":null,"link":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
 
 mkdir -p "$STATE_DIR" "$RUN_DIR"
 
@@ -290,16 +290,19 @@ focused_monitor() {
     | (($m | map(select(.focused)) | .[0]) // $m[0] // {}).name // empty'
 }
 
-# Sunshine's virtual touchscreen and pen ("Touch passthrough", "Pen
-# passthrough") only exist once a client uses them, and Hyprland spreads
-# absolute devices across the whole layout unless told which output they
-# belong to. Pin them to the streamed output.
+# Sunshine's virtual touchscreen, pen and absolute mouse report positions as
+# a fraction of the streamed picture (libvirtualhid ignores the viewport on
+# Linux), but Hyprland spreads absolute devices across the whole layout unless
+# told which output they belong to, so every tap lands in the wrong place. Pin
+# them to the streamed output. Names: "libvirtualhid-touchscreen",
+# "libvirtualhid-pen-tablet", "libvirtualhid-mouse-(absolute)" in current
+# Sunshine; "Touch passthrough" / "Pen passthrough" in older builds.
 map_input_devices() {
   local target="$1" names name
   [[ -n $target ]] || return 0
   names=$(hyprctl -j devices 2>/dev/null | jq -r '
     [(.touch // [])[], (.tablets // [])[]] | map(.name // empty)
-    | map(select(test("passthrough|sunshine"; "i"))) | unique[]') || return 0
+    | map(select(test("libvirtualhid|passthrough|sunshine"; "i"))) | unique[]') || return 0
   while IFS= read -r name; do
     [[ -n $name && $name =~ ^[A-Za-z0-9._:()-]+$ ]] || continue
     session | jq -e --arg k "$name=$target" '.mapped | index($k)' >/dev/null && continue
@@ -419,7 +422,158 @@ hook_start() {
 
 hook_stop() {
   log "hook-stop"
-  update_session '.client = null'
+  update_session '.client = null | .link = null'
+}
+
+# ---------------------------------------------------------------- connection
+#
+# The hooks only run when Moonlight starts or quits the Desktop app. Closing
+# Moonlight without quitting, and reconnecting later, resumes the same app and
+# runs neither, so whether a client is attached right now comes from
+# Sunshine's own log.
+
+client_connected() {
+  local pid line
+  pid=$(pgrep -x sunshine | head -1)
+  [[ -n $pid ]] || return 1
+  if sunshine_has_unit; then
+    line=$(journalctl --user _PID="$pid" -o cat -g 'CLIENT (DIS)?CONNECTED' -n 1 --no-pager 2>/dev/null)
+  else
+    line=$(grep -E 'CLIENT (DIS)?CONNECTED' "$RUN_DIR/sunshine.log" 2>/dev/null | tail -1)
+  fi
+  [[ $line == *"CLIENT CONNECTED"* ]]
+}
+
+# ---------------------------------------------------------------- USB tethering
+#
+# With USB tethering on, the tablet shows up as a network adapter: rndis_host
+# (Samsung), cdc_ncm / cdc_ether (other Android devices) or ipheth (iPad).
+# Moonlight reaches Sunshine over the cable at this computer's address on it.
+
+USB_DRIVERS="rndis_host cdc_ncm cdc_ether ipheth"
+
+iface_driver() { basename "$(readlink -f "/sys/class/net/$1/device/driver" 2>/dev/null)" 2>/dev/null; }
+
+link_kind() { # iface -> usb | wifi | tailscale | network
+  if [[ " $USB_DRIVERS " == *" $(iface_driver "$1") "* ]]; then echo usb
+  elif [[ $1 == tailscale* ]]; then echo tailscale
+  elif [[ -d /sys/class/net/$1/wireless ]]; then echo wifi
+  else echo network; fi
+}
+
+# Is Sunshine reachable through ufw from addresses like <ip> on <iface>?
+# open | blocked | off (ufw not running) | none (no ufw) | unknown.
+# Omarchy keeps /etc/ufw/user.rules world-readable, so no sudo is needed.
+firewall_status() { # ip iface
+  command -v ufw >/dev/null || { echo none; return; }
+  systemctl is-active -q ufw 2>/dev/null || { echo off; return; }
+  grep -q '^DEFAULT_INPUT_POLICY="ACCEPT"' /etc/default/ufw 2>/dev/null && { echo open; return; }
+  [[ -r /etc/ufw/user.rules ]] || { echo unknown; return; }
+  # A tuple: ### tuple ### allow <proto> <dport> <dst> <sport> <src> in[_<iface>] ...
+  awk -v ip="$1" -v ifc="$2" '
+    function num(a,  p) { split(a, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+    function within(a, c,  x, bits, m) {
+      if (c == "any" || c == "0.0.0.0/0") return 1
+      if (c !~ /^[0-9.]+(\/[0-9]+)?$/) return 0
+      split(c, x, "/"); bits = (x[2] == "" ? 32 : x[2]); m = 2 ^ (32 - bits)
+      return int(num(a) / m) == int(num(x[1]) / m)
+    }
+    function port_in(spec, port,  parts, k, i, r) {
+      if (spec == "any") return 1
+      k = split(spec, parts, ",")
+      for (i = 1; i <= k; i++) {
+        if (split(parts[i], r, ":") == 2) { if (port + 0 >= r[1] + 0 && port + 0 <= r[2] + 0) return 1 }
+        else if (parts[i] == port) return 1
+      }
+      return 0
+    }
+    BEGIN { n = split("tcp:47984 tcp:47989 tcp:48010 udp:47998 udp:47999 udp:48000", need, " ") }
+    $1 == "###" && $2 == "tuple" && $4 == "allow" && ($10 == "in" || $10 == "in_" ifc) && within(ip, $9) {
+      for (i = 1; i <= n; i++) {
+        split(need[i], pp, ":")
+        if (($5 == pp[1] || $5 == "any") && port_in($6, pp[2])) ok[i] = 1
+      }
+    }
+    END { for (i = 1; i <= n; i++) if (!ok[i]) { print "blocked"; exit } print "open" }
+  ' /etc/ufw/user.rules
+}
+
+# [{iface, ip, driver, speed (Mbit/s), defaultRoute, firewall}]
+usb_links() {
+  local i n d ip spd dev out=()
+  for i in /sys/class/net/*; do
+    n=${i##*/}
+    d=$(iface_driver "$n")
+    [[ " $USB_DRIVERS " == *" $d "* ]] || continue
+    ip=$(ip -4 -o addr show dev "$n" scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')
+    [[ -n $ip ]] || continue
+    # The interface's device is the USB interface; its parent has the speed.
+    dev=$(readlink -f "$i/device/..")
+    spd=$(cat "$dev/speed" 2>/dev/null || echo 0)
+    [[ $spd =~ ^[0-9]+$ ]] || spd=0
+    out+=("$(jq -cn --arg n "$n" --arg ip "$ip" --arg d "$d" --argjson s "$spd" \
+      --argjson r "$(ip route show default dev "$n" 2>/dev/null | grep -q . && echo true || echo false)" \
+      --arg fw "$(firewall_status "$ip" "$n")" \
+      '{iface: $n, ip: $ip, driver: $d, speed: $s, defaultRoute: $r, firewall: $fw}')")
+  done
+  ((${#out[@]})) || { echo '[]'; return; }
+  printf '%s\n' "${out[@]}" | jq -cs .
+}
+
+# Tethering makes the tablet a gateway, and NetworkManager prefers wired links,
+# so the computer's internet could start going through the tablet. While the
+# tablet display is on, take the default route off the USB link: for the
+# current connection only (nothing is saved; it resets when the cable is
+# unplugged), and only when another default route exists, so this can never
+# cut the computer off.
+usb_keep_internet() {
+  [[ $(settings | jq -r '.usbKeepInternet') == true ]] || return 0
+  command -v nmcli >/dev/null || return 0
+  local links n others
+  links=$(usb_links)
+  [[ $(jq 'map(select(.defaultRoute)) | length' <<<"$links") -gt 0 ]] || return 0
+  others=$(ip route show default 2>/dev/null |
+    grep -vcE "dev ($(jq -r 'map(.iface) | join("|")' <<<"$links"))( |$)" || true)
+  ((others > 0)) || return 0
+  for n in $(jq -r '.[] | select(.defaultRoute) | .iface' <<<"$links"); do
+    if nmcli device modify "$n" ipv4.never-default yes ipv6.never-default yes >>"$LOG" 2>&1; then
+      log "usb: $n no longer carries the default route"
+    else
+      log "usb: nmcli could not modify $n"
+    fi
+  done
+}
+
+# Which interface is carrying the stream: the one whose sent-bytes counter is
+# climbing fastest between two polls. Sunshine does not log the client's
+# address, and a resumed session runs no hook, so this is how the panel knows
+# a session is over USB.
+sample_transport() {
+  local f="$RUN_DIR/tx.json" cur prev
+  cur=$(for i in /sys/class/net/*; do
+      [[ ${i##*/} == lo ]] && continue
+      printf '%s %s\n' "${i##*/}" "$(cat "$i/statistics/tx_bytes" 2>/dev/null || echo 0)"
+    done | jq -Rsc --arg t "$(date +%s.%N)" \
+      '{t: ($t | tonumber), b: (split("\n") | map(select(. != "") | split(" ") | {(.[0]): (.[1] | tonumber)}) | add // {})}')
+  prev=$(read_json "$f" 'null')
+  write_atomic "$f" "$cur"
+  [[ $prev == null ]] && return 0
+  jq -nr --argjson p "$prev" --argjson c "$cur" '
+    ($c.t - $p.t) as $dt
+    | if $dt < 0.5 or $dt > 30 then empty else
+        [$c.b | to_entries[] | select($p.b[.key] != null) | {k: .key, r: ((.value - $p.b[.key]) / $dt)}]
+        | max_by(.r) // empty | select(.r > 65536) | .k
+      end'
+}
+
+track_link() {
+  local iface via
+  iface=$(sample_transport)
+  [[ -n $iface ]] || return 0
+  via=$(link_kind "$iface")
+  [[ $(session | jq -r '.link.iface // ""') == "$iface" ]] && return 0
+  log "stream is going over $iface ($via)"
+  update_session '.link = {iface: $i, via: $v}' --arg i "$iface" --arg v "$via"
 }
 
 # Fixes drift between what we think is going on and what is. Cheap enough to
@@ -442,7 +596,27 @@ reconcile() {
     return 0
   fi
 
-  [[ -n $(jq -r .busy <<<"$s") ]] && return 0
+  # reconcile runs under the lock, so nothing else is mid-operation: a busy
+  # flag left behind means an Extend, Mirror or Off was killed partway.
+  case "$(jq -r .busy <<<"$s")" in
+    stopping)
+      log "reconcile: an Off was interrupted, finishing it"
+      # Detached, and without our lock fd: it takes the lock itself once
+      # this poll lets go, and a shell reload can't kill it.
+      update_session '.busy = ""'
+      OTD_DETACHED=1 setsid -f "$CTL" off </dev/null >/dev/null 2>&1 9>&-
+      return 0
+      ;;
+    starting)
+      log "reconcile: an Extend/Mirror was interrupted"
+      update_session '.busy = ""'
+      add_error "Turning the tablet display on was interrupted. Choose Extend or Mirror again."
+      return 0
+      ;;
+  esac
+
+  usb_keep_internet
+  if client_connected; then track_link; fi
 
   if ! monitor_exists "$target"; then
     log "reconcile: $target vanished"
@@ -464,8 +638,10 @@ reconcile() {
 }
 
 print_state() {
-  local s st mons addrs
+  local s st mons addrs usb connected=false
   s=$(session)
+  usb=$(usb_links)
+  [[ $(jq -r .mode <<<"$s") != off ]] && client_connected && connected=true
   st=$(settings)
   mons=$(monitors_json)
   addrs=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print $2 "=" a[1]}' |
@@ -473,6 +649,7 @@ print_state() {
 
   jq -cn \
     --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson addrs "${addrs:-[]}" \
+    --argjson usb "$usb" --argjson connected "$connected" \
     --argjson installed "$(sunshine_installed && echo true || echo false)" \
     --argjson running "$(sunshine_running && echo true || echo false)" \
     --arg host "$(cat /etc/hostname 2>/dev/null || hostname)" \
@@ -485,6 +662,9 @@ print_state() {
       output: $s.output,
       target: $s.target,
       client: $s.client,
+      connected: $connected,
+      link: (if $connected then $s.link else null end),
+      usb: $usb,
       errors: $s.errors,
       notice: $s.notice,
       settings: $st,
@@ -493,7 +673,7 @@ print_state() {
                 | if . then {name, width, height, refresh: (.refreshRate | round), scale, x, y} else null end),
       monitors: ($mons | map(select(.name != $ours and .disabled != true) | .name)),
       host: $host,
-      addresses: $addrs
+      addresses: ($addrs | map(select(.ip as $a | $usb | map(.ip) | index($a) | not)))
     }
     # Moonlight defaults to 1280x720. A stream whose shape differs from the
     # display gets bars on two sides, and the tablet then adds bars on the
@@ -529,10 +709,14 @@ cmd_set() { # key value
     resolution) [[ $value == auto || $value =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || return 64 ;;
     refresh) [[ $value =~ ^(auto|[0-9]{2,3})$ ]] || return 64 ;;
     audio) [[ $value =~ ^(true|false)$ ]] || return 64 ;;
+    usb-keep-internet) [[ $value =~ ^(true|false)$ ]] || return 64 ;;
     *) echo "unknown setting: $key" >&2; return 64 ;;
   esac
   if [[ $key == audio ]]; then
     update_settings '.audio = ($v == "true")' --arg v "$value"
+  elif [[ $key == usb-keep-internet ]]; then
+    update_settings '.usbKeepInternet = ($v == "true")' --arg v "$value"
+    return 0
   else
     update_settings '.[$k] = $v' --arg k "$key" --arg v "$value"
   fi
@@ -565,22 +749,29 @@ open_admin() { # [path]
 
 cmd_doctor() {
   echo "== $APP doctor"
-  echo "sunshine:        $(command -v sunshine || echo 'NOT INSTALLED (run omarchy-install-service-sunshine)')"
+  echo "sunshine:        $(command -v sunshine || echo 'NOT INSTALLED (use Install Sunshine in the panel)')"
   echo "sunshine running: $(sunshine_running && echo yes || echo no)"
   echo "systemd unit:     $(sunshine_has_unit && echo "$SUNSHINE_UNIT ($(systemctl --user is-active "$SUNSHINE_UNIT"))" || echo none)"
   echo "sunshine hook:    $HOOK -> $CTL"
   echo "sunshine.conf:    $SUNSHINE_CONF ($(conf_has_block && echo managed || echo untouched))"
   echo "hyprland:         $(hyprctl version -j 2>/dev/null | jq -r .tag)"
   echo "encoder hint:     $(lspci 2>/dev/null | grep -iE 'vga|3d' | sed 's/.*: //' | head -2 | paste -sd';')"
-  if command -v ufw >/dev/null && sudo -n true 2>/dev/null; then
-    echo "ufw rules:        $(sudo -n ufw status | grep -c omarchy-sunshine) omarchy-sunshine rules"
+  local lan_ip lan_if links
+  read -r lan_if lan_ip < <(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) { if ($i == "dev") d = $(i + 1); if ($i == "src") a = $(i + 1) } print d, a}')
+  [[ -n $lan_ip ]] && echo "firewall (LAN):   $(firewall_status "$lan_ip" "$lan_if") for $lan_ip on $lan_if"
+  links=$(usb_links)
+  if [[ $(jq length <<<"$links") -gt 0 ]]; then
+    jq -r '.[] | "usb link:         \(.iface) (\(.driver), \(.speed) Mbit/s) at \(.ip); firewall \(.firewall)\(if .defaultRoute then "; carries a default route" else "" end)"' <<<"$links"
+  else
+    echo "usb link:         none (turn on USB tethering on the tablet to stream over the cable)"
   fi
+  echo "client:           $(client_connected && echo "connected$(session | jq -r '.link // empty | " over \(.via) (\(.iface))"')" || echo "not connected")"
   echo
   echo "== session";  session | jq .
   echo "== settings"; settings | jq .
   echo "== monitors"; monitors_json | jq -r '.[] | "\(.name)\t\(.width)x\(.height)@\(.refreshRate)\tscale \(.scale)\tat \(.x),\(.y)"'
   echo "== sunshine-ish input devices"
-  hyprctl -j devices | jq -r '[.mice[], .keyboards[], .touch[], .tablets[]] | map(.name // empty) | map(select(test("passthrough|sunshine"; "i")))[]' 2>/dev/null
+  hyprctl -j devices | jq -r '[.mice[], .keyboards[], .touch[], .tablets[]] | map(.name // empty) | map(select(test("libvirtualhid|passthrough|sunshine"; "i")))[]' 2>/dev/null
   echo "== last log lines"; tail -n 20 "$LOG" 2>/dev/null
 }
 
@@ -597,9 +788,11 @@ usage: $APP-ctl <command>
                            resolution auto|<W>x<H>
                            refresh  auto|60|90|120
                            audio    true|false (play sound on the tablet)
+                           usb-keep-internet true|false (default true)
   pair                     open Sunshine's PIN page to pair Moonlight
   admin                    open Sunshine's web UI
-  install                  install Sunshine (Omarchy installer, needs sudo)
+  install                  install Sunshine (fixed installer, needs sudo)
+  firewall                 open Sunshine's ports in ufw (needs sudo)
   clear-errors             dismiss errors and notices
   uninstall                turn off, restore sunshine.conf, delete state
                            (run before: omarchy plugin remove $APP)
@@ -609,6 +802,20 @@ Sunshine calls 'hook-start' and 'hook-stop' itself when Moonlight connects.
 USAGE
   exit 64
 }
+
+# Commands that change things run in their own session. The panel starts them,
+# and the shell destroys the panel (and kills what it started) whenever it
+# reloads plugins or restarts; an Off killed halfway leaves Sunshine stopped
+# and the headless output behind. The caller still waits for the result.
+case "${1:-}" in
+  extend | mirror | off | set | uninstall)
+    if [[ -z ${OTD_DETACHED:-} ]]; then
+      OTD_DETACHED=1 setsid "$CTL" "$@" </dev/null &
+      wait $!
+      exit $?
+    fi
+    ;;
+esac
 
 case "${1:-}" in
   state) cmd_state "${2:-}" ;;
@@ -622,6 +829,12 @@ case "${1:-}" in
   admin) open_admin ;;
   # Omarchy's own installer fails on the current package (it enables the
   # sunshine.service alias, which systemctl refuses); ours is a fixed copy.
+  # Opens Sunshine's ports in ufw for private networks, which covers USB
+  # tethering on any port and subnet. Same rules as the installer.
+  firewall)
+    setsid -f omarchy-launch-floating-terminal-with-presentation \
+      "$(dirname "$CTL")/omarchy-tablet-display-install-sunshine --firewall" >/dev/null 2>&1
+    ;;
   install)
     setsid -f omarchy-launch-floating-terminal-with-presentation \
       "$(dirname "$CTL")/omarchy-tablet-display-install-sunshine" >/dev/null 2>&1

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omarchy-tablet-display",
   "name": "Tablet Display",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Steven Southwell",
   "license": "MIT",
   "description": "Use an Android tablet or iPad as a low-latency second screen, mirrored or extended, streamed with Sunshine to Moonlight",
